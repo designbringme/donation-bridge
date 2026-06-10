@@ -4,7 +4,6 @@ const { Redis } = require("@upstash/redis");
 const app = express();
 app.use(express.json());
 
-// ── Redis ─────────────────────────────────────────────────────────────────────
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
@@ -13,27 +12,21 @@ const redis = new Redis({
 const DONATION_KEY = "donations";
 const MAX_AGE_MS   = 24 * 60 * 60 * 1000;
 
-// ── Debug: log setiap request masuk ──────────────────────────────────────────
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
-// ── Normalisasi payload dari berbagai platform ────────────────────────────────
 function normalizeDonation(platform, body) {
   const now = Date.now();
   console.log(`[normalize/${platform}] raw body:`, JSON.stringify(body));
 
   if (platform === "saweria") {
-    // Saweria bisa kirim dalam body.data atau langsung di body
     const d = (body.data && typeof body.data === "object") ? body.data : body;
     const amount = Number(d.amount || d.donation_amount || 0);
-    if (amount <= 0) {
-      console.log("[saweria] amount = 0, skip");
-      return null;
-    }
+    if (amount <= 0) return null;
     return {
-      id:        String(d.id || d._id || now),
+      id:        String(now),
       source:    "saweria",
       donorName: String(d.donator_name || d.name || "Anonymous"),
       amount,
@@ -46,7 +39,7 @@ function normalizeDonation(platform, body) {
     const amount = Number(body.amount || body.value || 0);
     if (amount <= 0) return null;
     return {
-      id:        String(body.trx_id || body.id || now),
+      id:        String(now),
       source:    "sociabuzz",
       donorName: String(body.from || body.username || body.name || "Anonymous"),
       amount,
@@ -59,7 +52,7 @@ function normalizeDonation(platform, body) {
     const amount = Number(body.amount || body.nominal || 0);
     if (amount <= 0) return null;
     return {
-      id:        String(body.id || body.transaction_id || now),
+      id:        String(now),
       source:    "bagibagi",
       donorName: String(body.sender || body.name || body.username || "Anonymous"),
       amount,
@@ -72,7 +65,7 @@ function normalizeDonation(platform, body) {
     const amount = Number(body.amount || body.total || 0);
     if (amount <= 0) return null;
     return {
-      id:        String(body.id || body.order_id || now),
+      id:        String(now),
       source:    "tako",
       donorName: String(body.username || body.display_name || body.name || "Anonymous"),
       amount,
@@ -84,36 +77,25 @@ function normalizeDonation(platform, body) {
   return null;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  POST /api/webhook/:platform
-// ════════════════════════════════════════════════════════════════════════════
 app.post("/api/webhook/:platform", async (req, res) => {
   const { platform } = req.params;
   const allowed = ["saweria", "sociabuzz", "bagibagi", "tako"];
 
   if (!allowed.includes(platform)) {
-    console.log("[webhook] Unknown platform:", platform);
     return res.status(400).json({ ok: false, reason: "Unknown platform: " + platform });
   }
 
   const donation = normalizeDonation(platform, req.body);
   if (!donation) {
-    console.log("[webhook] Donation null/invalid from:", platform);
-    // Tetap return 200 agar platform tidak retry terus-menerus
     return res.json({ ok: false, reason: "Invalid or zero-amount donation" });
   }
 
   try {
     const score = Date.now();
-    // PENTING: gunakan score sebagai ID agar Roblox bisa compare
     donation.id = String(score);
-
     await redis.zadd(DONATION_KEY, { score, member: JSON.stringify(donation) });
-
-    // Hapus donasi lama > 24 jam
     const cutoff = score - MAX_AGE_MS;
     await redis.zremrangebyscore(DONATION_KEY, "-inf", cutoff);
-
     console.log(`[webhook/${platform}] SAVED: ${donation.donorName} Rp${donation.amount} id=${score}`);
     return res.json({ ok: true, id: String(score) });
   } catch (err) {
@@ -122,17 +104,11 @@ app.post("/api/webhook/:platform", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  GET /api/donations?after=<score>
-//  Roblox polling — ambil semua donasi dengan score > after
-// ════════════════════════════════════════════════════════════════════════════
 app.get("/api/donations", async (req, res) => {
   const afterScore = Number(req.query.after || 0);
   console.log("[donations] polling, after =", afterScore);
 
   try {
-    // zrangebyscore: ambil member dengan score di antara (afterScore, +inf]
-    // CATATAN: Upstash Redis SDK v1 — pakai zrange dengan BYSCORE
     const raw = await redis.zrange(DONATION_KEY, afterScore + 1, "+inf", {
       byScore: true,
     });
@@ -145,12 +121,11 @@ app.get("/api/donations", async (req, res) => {
     for (const entry of raw) {
       try {
         const parsed = typeof entry === "string" ? JSON.parse(entry) : entry;
-        // id sudah di-set ke score saat simpan
         const entryScore = Number(parsed.id || 0);
         if (entryScore > latestScore) latestScore = entryScore;
         items.push(parsed);
       } catch (e) {
-        console.log("[donations] parse error, skip:", e.message);
+        console.log("[donations] parse error:", e.message);
       }
     }
 
@@ -162,39 +137,22 @@ app.get("/api/donations", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  GET /api/tail
-//  Roblox pakai ini saat server start — dapat ID donasi terakhir
-// ════════════════════════════════════════════════════════════════════════════
 app.get("/api/tail", async (req, res) => {
   try {
-    // Ambil entry dengan score tertinggi (1 entry terakhir)
     const result = await redis.zrange(DONATION_KEY, -1, -1);
-
     if (result && result.length > 0) {
       try {
         const parsed = typeof result[0] === "string" ? JSON.parse(result[0]) : result[0];
         const id = String(parsed.id || Date.now());
-        console.log("[tail] last id =", id);
         return res.json({ ok: true, id });
-      } catch (e) {
-        // parse error, fall through
-      }
+      } catch (e) {}
     }
-
-    const now = String(Date.now());
-    console.log("[tail] empty, using now =", now);
-    return res.json({ ok: true, id: now });
+    return res.json({ ok: true, id: String(Date.now()) });
   } catch (err) {
-    console.error("[tail] Redis error:", err.message);
     return res.json({ ok: true, id: String(Date.now()) });
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  GET /api/test-webhook
-//  Kirim donasi test langsung ke Redis (untuk debug tanpa platform)
-// ════════════════════════════════════════════════════════════════════════════
 app.get("/api/test-webhook", async (req, res) => {
   const score = Date.now();
   const donation = {
@@ -215,16 +173,12 @@ app.get("/api/test-webhook", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  GET /api/debug
-//  Lihat semua isi Redis (untuk debugging)
-// ════════════════════════════════════════════════════════════════════════════
 app.get("/api/debug", async (req, res) => {
   try {
-    const all = await redis.zrange(DONATION_KEY, 0, -1, { withScores: true });
+    const all = await redis.zrange(DONATION_KEY, 0, -1);
     const count = await redis.zcard(DONATION_KEY);
     return res.json({
-      ok:    true,
+      ok: true,
       count,
       items: all,
       env: {
@@ -237,21 +191,18 @@ app.get("/api/debug", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  GET /  —  Health check
-// ════════════════════════════════════════════════════════════════════════════
 app.get("/", (req, res) => {
   res.json({
     ok:      true,
     status:  "Donation Bridge running",
     version: "2.0.0",
     endpoints: {
-      healthCheck:  "GET  /",
-      webhook:      "POST /api/webhook/saweria  (atau sociabuzz|bagibagi|tako)",
-      polling:      "GET  /api/donations?after=<score>",
-      tail:         "GET  /api/tail",
-      testWebhook:  "GET  /api/test-webhook?name=Budi&amount=50000",
-      debug:        "GET  /api/debug  (lihat isi Redis)",
+      healthCheck: "GET  /",
+      webhook:     "POST /api/webhook/saweria",
+      polling:     "GET  /api/donations?after=<score>",
+      tail:        "GET  /api/tail",
+      testWebhook: "GET  /api/test-webhook?name=Budi&amount=50000",
+      debug:       "GET  /api/debug",
     },
   });
 });
