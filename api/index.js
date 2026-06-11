@@ -35,9 +35,16 @@ function normalizeDonation(platform, body) {
 
   if (platform === "saweria") {
     const d = (body.data && typeof body.data === "object") ? body.data : body;
-    const amount = Number(d.amount_raw || d.amount || d.donation_amount || d.etc?.amount_to_display || 0);
+    // Saweria pakai "amount_raw", bukan "amount"
+    const amount = Number(
+      d.amount_raw ||
+      d.amount ||
+      d.donation_amount ||
+      (d.etc && d.etc.amount_to_display) ||
+      0
+    );
     if (amount <= 0) {
-      console.log("[saweria] amount = 0, skip");
+      console.log("[saweria] amount = 0, skip. Fields tersedia:", Object.keys(d).join(", "));
       return null;
     }
     return {
