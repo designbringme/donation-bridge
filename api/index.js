@@ -1,8 +1,46 @@
 const express = require("express");
+const querystring = require("querystring");
 const { Redis } = require("@upstash/redis");
 
 const app = express();
-app.use(express.json());
+
+// ── Body parser custom — AMAN untuk Vercel Serverless Functions ─────────────
+// Vercel kadang sudah membaca/parse body request duluan SEBELUM masuk ke
+// Express, sehingga express.json() bawaan Express bisa mendapat req.body
+// kosong ({}). Middleware ini menangani kedua kemungkinan:
+//   1. Jika Vercel sudah mengisi req.body (object berisi data) → pakai itu.
+//   2. Jika req.body kosong/undefined → baca raw stream secara manual lalu
+//      parse sebagai JSON (atau urlencoded sebagai fallback).
+app.use((req, res, next) => {
+  if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+    return next();
+  }
+
+  let raw = "";
+  req.on("data", (chunk) => {
+    raw += chunk;
+  });
+  req.on("end", () => {
+    if (!raw) {
+      req.body = req.body || {};
+      return next();
+    }
+    try {
+      req.body = JSON.parse(raw);
+    } catch (e) {
+      try {
+        req.body = querystring.parse(raw);
+      } catch (e2) {
+        req.body = {};
+      }
+    }
+    next();
+  });
+  req.on("error", () => {
+    req.body = {};
+    next();
+  });
+});
 
 // ── CORS — wajib agar Roblox bisa akses ──────────────────────────────────────
 app.use((req, res, next) => {
@@ -24,7 +62,7 @@ const MAX_AGE_MS   = 24 * 60 * 60 * 1000;
 
 // ── Debug: log setiap request masuk ──────────────────────────────────────────
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} | content-type: ${req.headers["content-type"]}`);
   next();
 });
 
@@ -246,7 +284,7 @@ app.get("/", (req, res) => {
   res.json({
     ok:      true,
     status:  "Donation Bridge running",
-    version: "2.1.0",
+    version: "2.2.0",
     endpoints: {
       healthCheck:  "GET  /",
       webhook:      "POST /api/webhook/saweria  (atau sociabuzz|bagibagi|tako)",
