@@ -35,7 +35,7 @@ function normalizeDonation(platform, body) {
 
   if (platform === "saweria") {
     const d = (body.data && typeof body.data === "object") ? body.data : body;
-    const amount = Number(d.amount || d.donation_amount || 0);
+    const amount = Number(d.amount_raw || d.amount || d.donation_amount || d.etc?.amount_to_display || 0);
     if (amount <= 0) {
       console.log("[saweria] amount = 0, skip");
       return null;
